@@ -19,11 +19,13 @@ function init_eager()
     @async try
         sopts = SchedulerOptions(;allow_errors=true)
         scope = Dagger.ExactScope(Dagger.ThreadProc(1, 1))
+        topts = ThunkOptions(;occupancy=Dict(Dagger.ThreadProc=>0))
         atexit() do
             EAGER_FORCE_KILL[] = true
             close(EAGER_THUNK_CHAN)
         end
-        Dagger.compute(ctx, Dagger.delayed(eager_thunk; scope)(); options=sopts)
+        Dagger.compute(ctx, Dagger.delayed(eager_thunk; scope, options=topts)();
+                       options=sopts)
     catch err
         iob = IOContext(IOBuffer(), :color=>true)
         println(iob, "Error in eager scheduler:")
