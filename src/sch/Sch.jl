@@ -1047,11 +1047,14 @@ end
 
 const PROCESSOR_TASK_STATE = LockedObject(Dict{Processor,ProcessorState}())
 
+task_tid_for_processor(::Processor) = nothing
+task_tid_for_processor(proc::Dagger.ThreadProc) = proc.tid
+
 function start_processor_runner!(istate::ProcessorInternalState, return_queue::RemoteChannel)
+    to_proc = istate.proc
     # FIXME: Refactor so that we minimize boilerplate
-    return errormonitor(Threads.@spawn begin
+    proc_run_task = Task() do
         ctx = istate.ctx
-        to_proc = istate.proc
         proc_occupancy = UInt32(0)
         tasks = Dict{Int,Task}()
 
@@ -1105,12 +1108,18 @@ function start_processor_runner!(istate::ProcessorInternalState, return_queue::R
             tasks[thunk_id] = t
             proc_occupancy += task_occupancy
         end
-    end)
+    end
+    tid = task_tid_for_processor(to_proc)
+    if tid !== nothing
+        proc_run_task.sticky = true
+        ret = ccall(:jl_set_task_tid, Cint, (Any, Cint), proc_run_task, tid-1)
+    end
+    return errormonitor(schedule(proc_run_task))
 end
 function start_task_stealer!(istate::ProcessorInternalState)
-    return errormonitor(Threads.@spawn begin
+    to_proc = istate.proc
+    proc_steal_task = Task() do
         ctx = istate.ctx
-        to_proc = istate.proc
         while true
             timespan_start(ctx, :steal_wait, to_proc, nothing)
             lock(istate.steal) do
@@ -1165,7 +1174,13 @@ function start_task_stealer!(istate::ProcessorInternalState)
 
             # TODO: Try to steal from remote queues
         end
-    end)
+    end
+    tid = task_tid_for_processor(to_proc)
+    if tid !== nothing
+        proc_steal_task.sticky = true
+        ret = ccall(:jl_set_task_tid, Cint, (Any, Cint), proc_steal_task, tid-1)
+    end
+    return errormonitor(schedule(proc_steal_task))
 end
 
 """
@@ -1212,6 +1227,20 @@ function do_tasks(to_proc, return_queue, tasks)
         end
     end
     notify(istate.reschedule)
+
+    # Kick other processors' stealers
+    # TODO: Alternatively, automatically balance work instead of blindly enqueueing
+    states = collect(lock(values, PROCESSOR_TASK_STATE))
+    P = randperm(length(states))
+    for other_state in getindex.(Ref(states), P)
+        other_istate = other_state.state
+        if other_istate.proc === to_proc
+            continue
+        end
+        lock(other_istate.steal) do
+            notify(other_istate.steal)
+        end
+    end
 end
 
 """
