@@ -1050,6 +1050,9 @@ const PROCESSOR_TASK_STATE = LockedObject(Dict{Processor,ProcessorState}())
 task_tid_for_processor(::Processor) = nothing
 task_tid_for_processor(proc::Dagger.ThreadProc) = proc.tid
 
+stealing_permitted(::Processor) = true
+stealing_permitted(proc::Dagger.ThreadProc) = proc.owner != 1 || proc.tid != 1
+
 function start_processor_runner!(istate::ProcessorInternalState, return_queue::RemoteChannel)
     to_proc = istate.proc
     # FIXME: Refactor so that we minimize boilerplate
@@ -1201,7 +1204,11 @@ function do_tasks(to_proc, return_queue, tasks)
             reschedule = Doorbell()
             istate = ProcessorInternalState(ctx, to_proc, queue_locked, steal, reschedule)
             runner = start_processor_runner!(istate, return_queue)
-            stealer = start_task_stealer!(istate)
+            stealer = if stealing_permitted(to_proc)
+                start_task_stealer!(istate)
+            else
+                runner
+            end
             reschedule.waiter = runner
             return ProcessorState(istate, runner, stealer)
         end
