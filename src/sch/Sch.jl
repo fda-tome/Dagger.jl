@@ -1041,13 +1041,11 @@ struct ProcessorInternalState
     ctx::Context
     proc::Processor
     queue::LockedObject{PriorityQueue{Vector{Any}, UInt32, Base.Order.ForwardOrdering}}
-    steal::Threads.Condition
     reschedule::Doorbell
 end
 struct ProcessorState
     state::ProcessorInternalState
     runner::Task
-    stealer::Task
 end
 
 const PROCESSOR_TASK_STATE = LockedObject(Dict{Processor,ProcessorState}())
@@ -1060,10 +1058,9 @@ stealing_permitted(proc::Dagger.ThreadProc) = proc.owner != 1 || proc.tid != 1
 
 function start_processor_runner!(istate::ProcessorInternalState, return_queue::RemoteChannel)
     to_proc = istate.proc
-    # FIXME: Refactor so that we minimize boilerplate
     proc_run_task = Task() do
         ctx = istate.ctx
-        proc_occupancy = UInt32(0)
+        proc_occupancy = Ref(UInt32(0))
         tasks = Dict{Int,Task}()
 
         while isopen(return_queue)
@@ -1084,22 +1081,69 @@ function start_processor_runner!(istate::ProcessorInternalState, return_queue::R
                     return nothing
                 end
                 _, occupancy = peek(queue)
-                if UInt64(occupancy) + UInt64(proc_occupancy) <= typemax(UInt32)
+                if UInt64(occupancy) + UInt64(proc_occupancy[]) <= typemax(UInt32)
                     return dequeue_pair!(queue)
                 end
                 return nothing
             end
             if task_and_occupancy === nothing
-                # Request to steal some tasks
-                lock(istate.steal) do
-                    notify(istate.steal)
-                end
                 timespan_finish(ctx, :proc_run_fetch, to_proc, nothing)
+
+                if !stealing_permitted(to_proc)
+                    continue
+                end
+
+                if proc_occupancy[] == typemax(UInt32)
+                    continue
+                end
+
+                # Try to steal a task
+                timespan_start(ctx, :steal_local, to_proc, nothing)
+
+                # Try to steal from local queues randomly
+                # TODO: Prioritize stealing from busiest processors
+                states = collect(lock(values, PROCESSOR_TASK_STATE))
+                # TODO: Try to pre-allocate this
+                P = randperm(length(states))
+                for state in getindex.(Ref(states), P)
+                    other_istate = state.state
+                    if other_istate.proc === to_proc
+                        continue
+                    end
+                    task_and_occupancy = lock(other_istate.queue) do queue
+                        if length(queue) <= 1
+                            return nothing
+                        end
+                        task, occupancy = peek(queue)
+                        scope = task[5]
+                        if !isa(constrain(scope, Dagger.ExactScope(to_proc)),
+                                Dagger.InvalidScope) &&
+                           typemax(UInt32) - proc_occupancy[] >= occupancy
+                            # Compatible, steal this task
+                            # TODO: Steal from high-occupancy end
+                            return dequeue_pair!(queue)
+                        end
+                        return nothing
+                    end
+                    if task_and_occupancy !== nothing
+                        from_proc = other_istate.proc
+                        thunk_id = task[1]
+                        timespan_finish(ctx, :steal_local, to_proc, (;from_proc, thunk_id))
+                        # TODO: Keep stealing until we hit full occupancy?
+                        @goto execute
+                    end
+                end
+                timespan_finish(ctx, :steal_local, to_proc, nothing)
+
+                # TODO: Try to steal from remote queues
+
                 continue
             end
+
+            @label execute
             task, task_occupancy = task_and_occupancy
             thunk_id = task[1]
-            timespan_finish(ctx, :proc_run_fetch, to_proc, (;thunk_id, proc_occupancy, task_occupancy))
+            timespan_finish(ctx, :proc_run_fetch, to_proc, (;thunk_id, proc_occupancy=proc_occupancy[], task_occupancy))
 
             # Execute the task and return its result
             # N.B. This entire block to the end of the loop should be yield-less
@@ -1112,12 +1156,12 @@ function start_processor_runner!(istate::ProcessorInternalState, return_queue::R
                                     (CapturedException(err, bt), nothing)))
             finally
                 delete!(tasks, thunk_id)
-                proc_occupancy -= task_occupancy
+                proc_occupancy[] -= task_occupancy
                 notify(istate.reschedule)
             end
             errormonitor(t)
             tasks[thunk_id] = t
-            proc_occupancy += task_occupancy
+            proc_occupancy[] += task_occupancy
         end
     end
     tid = task_tid_for_processor(to_proc)
@@ -1126,72 +1170,6 @@ function start_processor_runner!(istate::ProcessorInternalState, return_queue::R
         ret = ccall(:jl_set_task_tid, Cint, (Any, Cint), proc_run_task, tid-1)
     end
     return errormonitor(schedule(proc_run_task))
-end
-function start_task_stealer!(istate::ProcessorInternalState)
-    to_proc = istate.proc
-    proc_steal_task = Task() do
-        ctx = istate.ctx
-        while true
-            timespan_start(ctx, :steal_wait, to_proc, nothing)
-            lock(istate.steal) do
-                wait(istate.steal)
-            end
-            timespan_finish(ctx, :steal_wait, to_proc, nothing)
-
-            timespan_start(ctx, :steal_local, to_proc, nothing)
-
-            # Try to steal from local queues randomly
-            # TODO: Prioritize stealing from busiest processors
-            states = collect(lock(values, PROCESSOR_TASK_STATE))
-            P = randperm(length(states))
-            success = false
-            for state in getindex.(Ref(states), P)
-                other_istate = state.state
-                if other_istate.proc === to_proc
-                    continue
-                end
-                result = lock(other_istate.queue) do queue
-                    if length(queue) <= 1
-                        return nothing
-                    end
-                    task, _ = peek(queue)
-                    scope = task[5]
-                    if !isa(constrain(scope, Dagger.ExactScope(to_proc)),
-                            Dagger.InvalidScope)
-                        # Compatible, steal this task
-                        # TODO: Steal from high-occupancy end
-                        return dequeue_pair!(queue)
-                    end
-                    return nothing
-                end
-                if result !== nothing
-                    success = true
-                    from_proc = other_istate.proc
-                    thunk_id = task[1]
-                    task, occupancy = result
-                    lock(istate.queue) do queue
-                        enqueue!(queue, task, occupancy)
-                    end
-                    notify(istate.reschedule)
-                    timespan_finish(ctx, :steal_local, to_proc, (;from_proc, thunk_id))
-                    # TODO: Keep stealing until we hit full occupancy?
-                    break
-                end
-            end
-            if success
-                continue
-            end
-            timespan_finish(ctx, :steal_local, to_proc, nothing)
-
-            # TODO: Try to steal from remote queues
-        end
-    end
-    tid = task_tid_for_processor(to_proc)
-    if tid !== nothing
-        proc_steal_task.sticky = true
-        ret = ccall(:jl_set_task_tid, Cint, (Any, Cint), proc_steal_task, tid-1)
-    end
-    return errormonitor(schedule(proc_steal_task))
 end
 
 """
@@ -1208,19 +1186,13 @@ function do_tasks(to_proc, return_queue, tasks)
         get!(states, to_proc) do
             queue = PriorityQueue{Vector{Any}, UInt32}()
             queue_locked = LockedObject(queue)
-            steal = Threads.Condition()
             reschedule = Doorbell()
-            istate = ProcessorInternalState(ctx, to_proc, queue_locked, steal, reschedule)
+            istate = ProcessorInternalState(ctx, to_proc, queue_locked, reschedule)
             runner = start_processor_runner!(istate, return_queue)
-            stealer = if stealing_permitted(to_proc)
-                start_task_stealer!(istate)
-            else
-                runner
-            end
             @static if VERSION < v"1.9"
                 reschedule.waiter = runner
             end
-            return ProcessorState(istate, runner, stealer)
+            return ProcessorState(istate, runner)
         end
     end
     istate = state.state
@@ -1245,7 +1217,7 @@ function do_tasks(to_proc, return_queue, tasks)
     end
     notify(istate.reschedule)
 
-    # Kick other processors' stealers
+    # Kick other processors to make them steal
     # TODO: Alternatively, automatically balance work instead of blindly enqueueing
     states = collect(lock(values, PROCESSOR_TASK_STATE))
     P = randperm(length(states))
@@ -1254,9 +1226,7 @@ function do_tasks(to_proc, return_queue, tasks)
         if other_istate.proc === to_proc
             continue
         end
-        lock(other_istate.steal) do
-            notify(other_istate.steal)
-        end
+        notify(other_istate.reschedule)
     end
 end
 
