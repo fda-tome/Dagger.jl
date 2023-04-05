@@ -977,6 +977,10 @@ function fire_tasks!(ctx, thunks::Vector{<:Tuple}, (gproc, proc), state)
     end
 end
 
+@static if VERSION >= v"1.9"
+const Doorbell = Event
+else
+# We need a sticky, resetable signal
 mutable struct Doorbell
     waiter::Union{Task,Nothing}
     @atomic sleeping::Int
@@ -1031,6 +1035,7 @@ function Base.notify(db::Doorbell)
         end
     end
 end
+end
 
 struct ProcessorInternalState
     ctx::Context
@@ -1065,6 +1070,9 @@ function start_processor_runner!(istate::ProcessorInternalState, return_queue::R
             # Wait for new tasks
             timespan_start(ctx, :proc_run_wait, to_proc, nothing)
             wait(istate.reschedule)
+            @static if VERSION >= v"1.9"
+                reset(istate.reschedule)
+            end
             timespan_finish(ctx, :proc_run_wait, to_proc, nothing)
 
             # Fetch a new task to execute
@@ -1209,7 +1217,9 @@ function do_tasks(to_proc, return_queue, tasks)
             else
                 runner
             end
-            reschedule.waiter = runner
+            @static if VERSION < v"1.9"
+                reschedule.waiter = runner
+            end
             return ProcessorState(istate, runner, stealer)
         end
     end
