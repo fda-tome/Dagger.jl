@@ -1111,7 +1111,7 @@ function start_processor_runner!(istate::ProcessorInternalState, return_queue::R
                         continue
                     end
                     task_and_occupancy = lock(other_istate.queue) do queue
-                        if length(queue) <= 1
+                        if length(queue) == 0
                             return nothing
                         end
                         task, occupancy = peek(queue)
