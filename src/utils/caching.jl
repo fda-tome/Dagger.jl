@@ -1,5 +1,5 @@
 function enable_disk_caching!(
-    ram_percentage_limit::Int=30, processes::Vector{Int}=procs(), disk_limit_gb::Int=16
+    ram_percentage_limit::Int=30, disk_limit_gb::Int=16, processes::Vector{Int}=procs()
 )
     !(0 < ram_percentage_limit <= 100) &&
         error("Ram limit values must be in (1, 100> range")
@@ -23,11 +23,11 @@ function enable_disk_caching!(
         end
     end
 
-    return enable_disk_caching!(mem_limits, processes, disk_limit_gb)
+    return enable_disk_caching!(mem_limits, disk_limit_gb, processes)
 end
 
 function enable_disk_caching!(
-    mem_limits::Dict{Int,Int}, processes::Vector{Int}=procs(), disk_limit_gb::Int=16
+    mem_limits::Dict{Int,Int}, disk_limit_gb::Int=16, processes::Vector{Int}=procs(),
 )
     results = [
         remotecall(id) do
