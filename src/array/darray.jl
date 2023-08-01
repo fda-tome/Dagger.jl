@@ -149,13 +149,13 @@ DArray{T, N}(domain, subdomains, chunks, partitioning, concat=cat) where {T,N} =
 
 function DArray(T, domain::ArrayDomain{N},
                 subdomains::AbstractArray{ArrayDomain{N}, N},
-                chunks::AbstractArray{<:Any, N}, partitioning::B, concat=cat) where {N,B<:AbstractMultiBlocks{N}}
+                chunks::AbstractArray{<:Any, N}, partitioning::B; concat=cat) where {N,B<:AbstractMultiBlocks{N}}
     DArray{T,N,B,typeof(concat)}(domain, subdomains, chunks, partitioning, concat)
 end
 
 function DArray(T, domain::ArrayDomain{N},
                 subdomains::ArrayDomain{N},
-                chunks::Any, partitioning::B, concat=cat) where {N,B<:AbstractSingleBlocks{N}}
+                chunks::Any, partitioning::B; concat=cat) where {N,B<:AbstractSingleBlocks{N}}
     _subdomains = Array{ArrayDomain{N}, N}(undef, ntuple(i->1, N)...)
     _subdomains[1] = subdomains
     _chunks = Array{Any, N}(undef, ntuple(i->1, N)...)
@@ -273,6 +273,9 @@ end
 If a `DArray` tree has a `Thunk` in it, make the whole thing a big thunk.
 """
 function Base.fetch(c::DArray{T}) where T
+    if c.partitioning isa AbstractSingleBlocks
+        return c
+    end
     if any(istask, chunks(c))
         thunks = chunks(c)
         sz = size(thunks)
